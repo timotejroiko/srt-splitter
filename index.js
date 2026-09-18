@@ -6,7 +6,7 @@
  * Orchestration only: config -> native binding -> relay loop -> cleanup.
  */
 
-const { loadConfig } = require("./src/config");
+const { loadConfig, resolveSourceHost } = require("./src/config");
 const { printHelp } = require("./src/help");
 const { createSrt } = require("./src/srt");
 const { Relay } = require("./src/relay");
@@ -15,6 +15,9 @@ async function main() {
 	let cfg;
 	try {
 		cfg = loadConfig(process.argv);
+		if (cfg) {
+			cfg = await resolveSourceHost(cfg);
+		}
 	} catch (err) {
 		console.error("config error:", err.message);
 		printHelp();
@@ -36,7 +39,7 @@ async function main() {
 	let stopping = false;
 	const stop = () => {
 		if (stopping) {
-			process.exit(1); // second signal: force out of blocking connect
+			process.exit(1); // second signal: exit now instead of waiting out the epoll block
 		}
 		stopping = true;
 		relay.shutdown();

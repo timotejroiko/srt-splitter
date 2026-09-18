@@ -27,6 +27,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const https = require("https");
 const path = require("path");
+const { patchBuildScript, patchBindingCc } = require("./patches");
 
 const SRT_TAG = process.env.SRT_VERSION || "v1.5.7";
 const ROOT = path.join(__dirname, "..");
@@ -34,6 +35,7 @@ const DEP = path.join(ROOT, "node_modules", "@eyevinn", "srt");
 const SRT_DIR = path.join(DEP, "deps", "srt");
 const BUILD_DIR = path.join(DEP, "deps", "build");
 const BUILD_SCRIPT = path.join(DEP, "scripts", "build-srt-sdk.js");
+const BINDING_CC = path.join(DEP, "src", "node-srt.cc");
 const SSL_SIDECAR = path.join(ROOT, ".deps", "openssl");
 
 // FireDaemon publishes EV-signed zips with SHA-256 on the download page.
@@ -207,42 +209,6 @@ function report(d) {
 	console.log("openssl:", d.openssl || "not found (auto-downloaded on setup)");
 }
 
-// --- build-script surgery (idempotent, re-applied every run) ---
-
-function patchBuildScript(vs, opensslRoot) {
-	let src = fs.readFileSync(BUILD_SCRIPT, "utf8");
-	const orig = src;
-	if (isWin && vs && vs.generator) {
-		src = src.replaceAll("Visual Studio 16 2019", vs.generator);
-	}
-	// Upstream bug: bare mkdirSync crashes on a stale dir.
-	src = src.replace("fs.mkdirSync(buildDir);", "fs.mkdirSync(buildDir, { recursive: true });");
-	// Slim flags (apps/examples off, C++11 threads so pthreads is never
-	// consulted on Windows).
-	src = src.replace("'-A', process.arch", "'-A', process.arch, '-DENABLE_APPS=OFF', '-DENABLE_EXAMPLES=OFF', '-DENABLE_STDCXX_SYNC=ON'");
-	if (isWin) {
-		// Cut the vcpkg openssl/pthreads/integrate paragraphs: cmake gets
-		// -DOPENSSL_ROOT_DIR pointing at the prebuilt tree instead.
-		// Idempotent: only cut when the original block is still present.
-		const start = src.indexOf('console.log("Building OpenSSL");');
-		const end = src.indexOf('console.log("Running cmake generator");');
-		if (start >= 0 && end >= 0 && end > start) {
-			src = src.slice(0, start) + 'console.log("Skipping vcpkg, using OPENSSL_ROOT_DIR");\n  ' + src.slice(end);
-		}
-		if (!src.includes("-DOPENSSL_ROOT_DIR=")) {
-			// Escape backslashes: the patched line is single-quoted JS in
-			// the target file, so C:\x becomes an octal escape under
-			// "use strict" and kills the script (seen: \U in \Users).
-			const esc = opensslRoot.replace(/\\/g, "\\\\");
-			src = src.replace(/'-DCMAKE_TOOLCHAIN_FILE=[^']*'/, `'"-DOPENSSL_ROOT_DIR=${esc}"'`);
-		}
-	}
-	if (src !== orig) {
-		fs.writeFileSync(BUILD_SCRIPT, src);
-		log("patched upstream build script for this run");
-	}
-}
-
 // --- main flow ---
 
 function ensureDep() {
@@ -294,6 +260,7 @@ async function main() {
 		return;
 	}
 	ensureDep();
+	patchBindingCc({ bindingCc: BINDING_CC, log });
 	if (!isWin) {
 		// POSIX needs no surgery: the binding's own install script is
 		// ./configure && make && node-gyp rebuild, which works against
@@ -331,7 +298,7 @@ async function main() {
 	}
 	log("OpenSSL: " + opensslRoot);
 	pinSrt();
-	patchBuildScript(d.vs, opensslRoot);
+	patchBuildScript({ buildScript: BUILD_SCRIPT, vs: d.vs, opensslRoot, isWin, log });
 	log(`building libsrt ${SRT_TAG} (single configure)...`);
 	run(process.execPath, [BUILD_SCRIPT], {
 		cwd: DEP,

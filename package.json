@@ -15,6 +15,6 @@
 		"setup": "node scripts/setup.js"
 	},
 	"dependencies": {
-		"@eyevinn/srt": "github:Eyevinn/node-srt#master"
+		"@eyevinn/srt": "github:Eyevinn/node-srt#0dfdb40dde2a2d81b1fc79e5d3cb3cf1076db465"
 	}
 }

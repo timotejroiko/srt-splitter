@@ -1,5 +1,17 @@
 "use strict";
 
+const { LIVE_MAX_PAYLOAD } = require("./srt");
+
+// Loop mechanics: fixed implementation details, not operator tunables.
+// - RECONNECT_DELAY_MS throttles bind/connect retries (accept-path
+//   recreation bypasses it; a bind failure inside re-arms it).
+// - EPOLL_WAIT_MS only caps idle block time and SIGINT shutdown lag; it
+//   does not delay ready-packet forwarding (level-triggered epoll).
+// - DRAIN_MAX bounds per-wakeup fanout stall so a burst can't starve accepts.
+const RECONNECT_DELAY_MS = 1000;
+const EPOLL_WAIT_MS = 500;
+const DRAIN_MAX = 128;
+
 /**
  * Core SRT relay: upstream source -> N egress clients.
  * One epoll container drives everything. All calls are blocking sync
@@ -8,17 +20,21 @@
  * and drained in a bounded loop per wakeup.
  *
  * Facts from the native binding (node-srt.cc) that shape this code:
- * - accept() retires the listen socket (success AND failure paths
- *   srt_close it), so listeners are recreated after any accept attempt.
- *   Recreation on the accept path is immediate; reconnectDelayMs only
+ * - Unpatched accept() retires the listen socket (success AND failure
+ *   paths srt_close it). Setup patches the success path to keep the
+ *   listener open (upstream PR #81); the failure path still retires it.
+ *   acceptDownstream() keeps the listener when still LISTENING and
+ *   recreates immediately only when dead. The retry throttle only
  *   throttles retries after a bind failure.
  * - read() is srt_recvmsg: one call = one whole message, so one read
  *   fans out as one write per client and framing is preserved.
+ * - Reads and PAYLOADSIZE both use the fixed live max (see srt.js):
+ *   smaller receives truncate, smaller PAYLOADSIZE breaks forwarding.
  * - srt_close() auto-removes the socket from epoll containers, so
  *   drop paths only need close (binding exposes no epoll-remove).
  * - Listener socket options are inherited by accepted sockets, so the
- *   downstream listener carries the egress buffer profile and the
- *   listener-mode upstream listener carries STREAMID.
+ *   downstream listener carries the egress buffer profile. STREAMID is
+ *   the exception: listeners don't propagate it (caller-mode only).
  *
  * Slow-client policy: non-blocking sends (SNDSYN=false); any write
  * failure drops that client at the live edge. No per-client buffering.
@@ -34,6 +50,8 @@ class Relay {
 		this.downListen = -1;
 		this.upListen = -1;
 		this.upConn = -1;
+		this.pendingUp = -1; // caller-mode handshake in flight (CONNECTING)
+		this.pendingUpSince = 0;
 		this.lastUpRetry = 0;
 		this.lastDownRetry = 0;
 		this.egress = new Set();
@@ -94,7 +112,11 @@ class Relay {
 	// profile (TLPKTDROP, TSBPDMODE, NAKREPORT, congestion) to known
 	// state; latency set after. TRANSTYPE is write-only on some builds,
 	// so TLPKTDROP is pinned explicitly too. All *_BUF options are
-	// pre-bind only: set here.
+	// pre-bind only: set here. Latency and encryption are per-side
+	// (o.latency / o.passphrase / o.pbKeyLen): one TSBPD value covers both
+	// directions of that side. libsrt decrypts ingest on the upstream
+	// socket and encrypts egress per client socket, so mixed topologies
+	// need no relay-level crypto handling.
 	applyLiveProfile(fd, o) {
 		return (
 			this.setOpt(fd, this.c.SRTO_TRANSTYPE, 0) && // SRTT_LIVE
@@ -103,13 +125,12 @@ class Relay {
 			this.setOpt(fd, this.c.SRTO_SNDBUF, o.sndBuf) &&
 			this.setOpt(fd, this.c.SRTO_UDP_RCVBUF, o.udpRcvBuf) &&
 			this.setOpt(fd, this.c.SRTO_UDP_SNDBUF, o.udpSndBuf) &&
-			this.setOpt(fd, this.c.SRTO_RCVLATENCY, this.cfg.rcvLatency) &&
-			this.setOpt(fd, this.c.SRTO_PEERLATENCY, this.cfg.peerLatency) &&
+			this.setOpt(fd, this.c.SRTO_RCVLATENCY, o.latency) &&
+			this.setOpt(fd, this.c.SRTO_PEERLATENCY, o.latency) &&
 			this.setOpt(fd, this.c.SRTO_PEERIDLETIMEO, this.cfg.peerIdleTimeout) &&
-			this.setOpt(fd, this.c.SRTO_LINGER, this.cfg.linger) &&
-			this.setOpt(fd, this.c.SRTO_PAYLOADSIZE, this.cfg.chunkSize) &&
-			(!this.cfg.passphrase || this.setOpt(fd, this.c.SRTO_PASSPHRASE, this.cfg.passphrase)) &&
-			(!this.cfg.passphrase || this.setOpt(fd, this.c.SRTO_PBKEYLEN, this.cfg.pbKeyLen))
+			this.setOpt(fd, this.c.SRTO_PAYLOADSIZE, LIVE_MAX_PAYLOAD) &&
+			(!o.passphrase || this.setOpt(fd, this.c.SRTO_PASSPHRASE, o.passphrase)) &&
+			(!o.passphrase || this.setOpt(fd, this.c.SRTO_PBKEYLEN, o.pbKeyLen))
 		);
 	}
 
@@ -121,19 +142,26 @@ class Relay {
 				rcvBuf: this.cfg.rcvBuf,
 				sndBuf: this.cfg.upstreamSndBuf,
 				udpRcvBuf: this.cfg.udpRcvBuf,
-				udpSndBuf: this.cfg.upstreamUdpSndBuf
+				udpSndBuf: this.cfg.upstreamUdpSndBuf,
+				latency: this.cfg.upstreamLatency,
+				passphrase: this.cfg.upstreamPassphrase,
+				pbKeyLen: this.cfg.upstreamPbKeyLen
 			}) && (!this.cfg.streamId || this.setOpt(fd, this.c.SRTO_STREAMID, this.cfg.streamId))
 		);
 	}
 
-	// Downstream listener; accepted egress sockets inherit these. Big
-	// SND side absorbs egress bursts, RCV side is control traffic only.
+	// Downstream listener; accepted egress sockets inherit these (except
+	// STREAMID, which listeners don't propagate). Big SND side absorbs
+	// egress bursts, RCV side is control traffic only.
 	applyDownOpts(fd) {
 		return this.applyLiveProfile(fd, {
 			rcvBuf: this.cfg.egressRcvBuf,
 			sndBuf: this.cfg.sndBuf,
 			udpRcvBuf: this.cfg.egressUdpRcvBuf,
-			udpSndBuf: this.cfg.udpSndBuf
+			udpSndBuf: this.cfg.udpSndBuf,
+			latency: this.cfg.downstreamLatency,
+			passphrase: this.cfg.downstreamPassphrase,
+			pbKeyLen: this.cfg.downstreamPbKeyLen
 		});
 	}
 
@@ -151,8 +179,13 @@ class Relay {
 	}
 	// Listener accepts must never block: accept() on an empty backlog
 	// would stall the whole relay (all reads/writes live on this thread).
-	// SRT docs name blocking accept as default; opt-out explicitly.
-	this.setOpt(fd, this.c.SRTO_RCVSYN, false);
+	// SRT docs name blocking accept as default; opt-out explicitly. A
+	// failure here is fatal to the socket: blocking accepts would freeze
+	// the loop, so bail instead of binding a blocking listener.
+	if (!this.setOpt(fd, this.c.SRTO_RCVSYN, false)) {
+		this.safeClose(fd);
+		return -1;
+	}
 	try {
 		this.srt.bind(fd, host, port);
 		this.srt.listen(fd, backlog);
@@ -169,7 +202,7 @@ class Relay {
 		if (this.downListen >= 0 || !this.running) {
 			return;
 		}
-		if (now - this.lastDownRetry < this.cfg.reconnectDelayMs) {
+		if (now - this.lastDownRetry < RECONNECT_DELAY_MS) {
 			return;
 		}
 		this.lastDownRetry = now;
@@ -188,7 +221,7 @@ class Relay {
 		if (this.cfg.mode !== "listener" || this.upListen >= 0 || this.upConn >= 0 || !this.running) {
 			return;
 		}
-		if (now - this.lastUpRetry < this.cfg.reconnectDelayMs) {
+		if (now - this.lastUpRetry < RECONNECT_DELAY_MS) {
 			return;
 		}
 		this.lastUpRetry = now;
@@ -204,10 +237,10 @@ class Relay {
 	}
 
 	ensureUpstreamCaller(now) {
-		if (this.cfg.mode !== "caller" || this.upConn >= 0 || !this.running) {
+		if (this.cfg.mode !== "caller" || this.upConn >= 0 || this.pendingUp >= 0 || !this.running) {
 			return;
 		}
-		if (now - this.lastUpRetry < this.cfg.reconnectDelayMs) {
+		if (now - this.lastUpRetry < RECONNECT_DELAY_MS) {
 			return;
 		}
 		this.lastUpRetry = now;
@@ -222,42 +255,98 @@ class Relay {
 			this.safeClose(sock);
 			return;
 		}
-		// Non-blocking reads: the drain loop polls until empty instead of
-		// stalling on RCVTIMEO. RCVTIMEO stays as a harmless backup.
-		this.setOpt(sock, this.c.SRTO_RCVSYN, false);
-		this.setOpt(sock, this.c.SRTO_RCVTIMEO, this.cfg.upReadTimeoutMs);
-		this.setOpt(sock, this.c.SRTO_CONNTIMEO, this.cfg.connTimeout);
+		// Non-blocking reads: the drain loop polls until empty. RCVTIMEO is
+		// not set: it does not bound non-blocking reads.
+		if (!this.setOpt(sock, this.c.SRTO_RCVSYN, false)) {
+			this.safeClose(sock);
+			return;
+		}
+		this.setOpt(sock, this.c.SRTO_CONNTIMEO, this.cfg.upstreamConnTimeout);
+		// Optional explicit local bind (multihomed hosts): pins the egress
+		// NIC before connecting. Port 0 leaves selection to the system.
+		if (this.cfg.callerBindHost) {
+			try {
+				this.srt.bind(sock, this.cfg.callerBindHost, 0);
+			} catch (err) {
+				this.log("upstream bind failed:", err.message);
+				this.safeClose(sock);
+				return;
+			}
+		}
 		try {
 			this.srt.connect(sock, this.cfg.sourceHost, this.cfg.sourcePort);
 		} catch {
 			this.safeClose(sock);
 			return;
 		}
-		try {
-			this.srt.epollAddUsock(this.epid, sock, this.c.EPOLL_IN | this.c.EPOLL_ERR);
-		} catch (err) {
-			this.log("upstream epoll add failed:", err.message);
-			this.safeClose(sock);
+		// connect() with RCVSYN=false only starts the handshake: the socket
+		// is CONNECTING, not connected. Park it as pending; checkPendingUpstream()
+		// promotes it once the state reads CONNECTED and logs only then.
+		this.pendingUp = sock;
+		this.pendingUpSince = now;
+		this.checkPendingUpstream(now);
+	}
+
+	// Non-blocking connect completion. Runs on every poll so promotion never
+	// waits longer than one epoll wait. Terminal non-connected states and
+	// connTimeout both drop the attempt; the retry throttle re-arms the next.
+	checkPendingUpstream(now) {
+		if (this.pendingUp < 0) {
 			return;
 		}
-		this.upConn = sock;
-		this.log("upstream connected to", this.cfg.sourceHost + ":" + this.cfg.sourcePort);
+		const st = this.stateOf(this.pendingUp);
+		if (st === this.c.SRTS_CONNECTED) {
+			const sock = this.pendingUp;
+			this.pendingUp = -1;
+			try {
+				this.srt.epollAddUsock(this.epid, sock, this.c.EPOLL_IN | this.c.EPOLL_ERR);
+			} catch (err) {
+				this.log("upstream epoll add failed:", err.message);
+				this.safeClose(sock);
+				return;
+			}
+			this.upConn = sock;
+			this.log("upstream connected to", this.cfg.sourceHost + ":" + this.cfg.sourcePort);
+			return;
+		}
+		if (st !== this.c.SRTS_CONNECTING || now - this.pendingUpSince > this.cfg.upstreamConnTimeout) {
+			this.safeClose(this.pendingUp);
+			this.pendingUp = -1;
+			this.lastUpRetry = now;
+			this.log("upstream connect failed (" + (st !== this.c.SRTS_CONNECTING ? "state=" + st : "timed out") + "), reconnecting");
+		}
 	}
 
 	acceptDownstream() {
+		const listenFd = this.downListen;
 		let fd = -1;
 		try {
-			fd = this.srt.accept(this.downListen);
+			fd = this.srt.accept(listenFd);
 		} catch {
 			fd = -1;
 		}
-		this.downListen = -1;
-		// The old listen fd is dead (native closed it): recreate now.
-		// Bypassing the retry throttle here is correct; a bind failure
-		// inside re-arms it via lastDownRetry.
-		this.lastDownRetry = 0;
-		this.ensureDownListener(Date.now());
+		// Patched binding keeps the listener open on success; unpatched
+		// builds (and the failure path) retire it. Keep when LISTENING,
+		// recreate immediately only when dead — same code works either way.
+		// One accept per wakeup: probing an empty backlog would hit the
+		// failure path and retire the listener, so level-triggered epoll
+		// re-fires while connects remain.
+		if (this.downListen === listenFd && this.stateOf(listenFd) === this.c.SRTS_LISTENING) {
+			// listener alive — keep it, nothing to do.
+		} else {
+			this.safeClose(listenFd);
+			if (this.downListen === listenFd) {
+				this.downListen = -1;
+			}
+			this.lastDownRetry = 0;
+			this.ensureDownListener(Date.now());
+		}
 		if (fd === undefined || fd === null || fd < 0) {
+			return;
+		}
+		if (this.egress.size >= this.cfg.maxClients) {
+			this.safeClose(fd);
+			this.log("client rejected (max " + this.cfg.maxClients + " reached)");
 			return;
 		}
 		if (!this.setOpt(fd, this.c.SRTO_SNDSYN, false)) {
@@ -290,10 +379,14 @@ class Relay {
 			this.lastUpRetry = 0;
 			return;
 		}
-		// Listener opts (incl. STREAMID) are inherited; reads go
-		// non-blocking like the caller path.
-		this.setOpt(fd, this.c.SRTO_RCVSYN, false);
-		this.setOpt(fd, this.c.SRTO_RCVTIMEO, this.cfg.upReadTimeoutMs);
+		// Accepted sockets inherit the listener's opts except STREAMID, which
+		// listeners do not propagate (caller-mode only); reads go
+		// non-blocking like the caller path. RCVSYN failure is fatal: a
+		// blocking upstream read would stall fanout.
+		if (!this.setOpt(fd, this.c.SRTO_RCVSYN, false)) {
+			this.safeClose(fd);
+			return;
+		}
 		try {
 			this.srt.epollAddUsock(this.epid, fd, this.c.EPOLL_IN | this.c.EPOLL_ERR);
 		} catch (err) {
@@ -329,10 +422,10 @@ class Relay {
 	// cap bounds fanout stall (N sync writes per message) so a burst
 	// can't starve accepts; level-triggered epoll re-fires for the rest.
 	drainUpstream() {
-		for (let i = 0; i < this.cfg.drainMax; i++) {
+		for (let i = 0; i < DRAIN_MAX; i++) {
 			let chunk;
 			try {
-				chunk = this.srt.read(this.upConn, this.cfg.chunkSize);
+				chunk = this.srt.read(this.upConn, LIVE_MAX_PAYLOAD);
 			} catch {
 				break; // empty (non-blocking) or error; state checked once below
 			}
@@ -402,6 +495,9 @@ class Relay {
 		}
 		this.log("listening for clients on", this.cfg.listenHost + ":" + this.cfg.listenPort);
 		if (this.cfg.mode === "listener") {
+			if (this.cfg.streamId) {
+				this.log("warning: streamId is caller-mode only (listeners don't propagate it) — ignored");
+			}
 			this.ensureUpListener(Date.now());
 		}
 	}
@@ -411,12 +507,13 @@ class Relay {
 		this.ensureDownListener(now);
 		if (this.cfg.mode === "caller") {
 			this.ensureUpstreamCaller(now);
+			this.checkPendingUpstream(now);
 		} else {
 			this.ensureUpListener(now);
 		}
 		let events = [];
 		try {
-			events = this.srt.epollUWait(this.epid, this.cfg.epollWaitMs) || [];
+			events = this.srt.epollUWait(this.epid, EPOLL_WAIT_MS) || [];
 		} catch (err) {
 			this.log("epoll:", err.message);
 			return;
@@ -427,20 +524,20 @@ class Relay {
 			}
 			const fd = ev.socket;
 			const fl = ev.events;
-			// Live routing: accept calls recycle listen fds mid-batch, so
-			// stale snapshotted ids would double-accept and churn (or
+			// Live routing: a failed accept recycles the listen fd mid-batch,
+			// so stale snapshotted ids would double-accept and churn (or
 			// drop) the fresh listener. Stale ids fall through to the ERR
 			// check, which ignores unknown fds.
 		if (fl & this.c.EPOLL_IN) {
 			if (fd === this.downListen) {
-				// One accept per wakeup. The native accept() retires the
-				// listen socket either way, and a recreated listener has
-				// no reliable "backlog empty" signal: epoll re-fires on
-				// the STALE fd (level-triggered state survives close),
-				// and accept on the fresh fd blocks if the backlog
-				// drained. epoll re-fires while connects remain, so burst
-				// clients are picked up on subsequent wakeups (~instant,
-				// not a full epollWaitMs: EPOLL_IN is level-triggered).
+				// One accept per wakeup. A failed accept retires the listen
+				// socket, and a recreated listener has no reliable "backlog
+				// empty" signal: epoll re-fires on the STALE fd
+				// (level-triggered state survives close), and accept on the
+				// fresh fd throws if the backlog drained. epoll re-fires
+				// while connects remain, so burst clients are picked up on
+				// subsequent wakeups (~instant, not a full EPOLL_WAIT_MS:
+				// EPOLL_IN is level-triggered).
 				this.acceptDownstream();
 			} else if (fd === this.upListen) {
 				this.acceptUpstream();
@@ -473,7 +570,9 @@ class Relay {
 		let up = "";
 		if (this.upConn >= 0) {
 			try {
-				const s = this.srt.stats(this.upConn, false);
+				// Clear on read so loss/drop cover this reporting interval,
+				// like the JS in/out rates above — not process lifetime.
+				const s = this.srt.stats(this.upConn, true);
 				up =
 					" upRecv=" + Number(s.mbpsRecvRate).toFixed(2) + "Mbps" +
 					" loss=" + s.pktRcvLoss +
@@ -505,6 +604,8 @@ class Relay {
 		}
 		this.egress.clear();
 		this.safeClose(this.upConn);
+		this.safeClose(this.pendingUp);
+		this.pendingUp = -1;
 		this.safeClose(this.upListen);
 		this.safeClose(this.downListen);
 		// No epoll release: the binding exposes none, and epid dies with
