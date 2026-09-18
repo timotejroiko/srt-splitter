@@ -1,0 +1,20 @@
+{
+	"name": "srt-splitter",
+	"version": "0.2.0",
+	"description": "High-performance SRT splitter: one upstream SRT source fanned out to many SRT clients",
+	"main": "index.js",
+	"bin": {
+		"srt-splitter": "index.js"
+	},
+	"type": "commonjs",
+	"engines": {
+		"node": ">=18"
+	},
+	"scripts": {
+		"start": "node index.js",
+		"setup": "node scripts/setup.js"
+	},
+	"dependencies": {
+		"@eyevinn/srt": "github:Eyevinn/node-srt#master"
+	}
+}
