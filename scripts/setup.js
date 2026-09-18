@@ -285,6 +285,8 @@ async function main() {
 			cwd: DEP,
 			env: { ...process.env, NODE_SRT_CHECKOUT: SRT_TAG }
 		});
+		normalizePosixLibDir();
+		log("compiling N-API addon...");
 		const rebuildArgs = ["--prefix", DEP, "run", "rebuild"];
 		if (process.env.PREBUILD_ARCH) {
 			rebuildArgs.push("--", `--arch=${process.env.PREBUILD_ARCH}`);
