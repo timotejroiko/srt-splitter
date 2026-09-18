@@ -253,6 +253,20 @@ function copyRuntimeDlls(opensslRoot) {
 	}
 	log(`runtime DLLs -> build/Release (${copied} files)`);
 }
+function normalizePosixLibDir() {
+	const expected = path.join(BUILD_DIR, "lib");
+	const archive = path.join(expected, "libsrt.a");
+	if (fs.existsSync(archive)) {
+		return;
+	}
+	const alternate = path.join(BUILD_DIR, "lib64");
+	if (!fs.existsSync(path.join(alternate, "libsrt.a"))) {
+		throw new Error(`libsrt.a not found under ${BUILD_DIR}/lib or ${BUILD_DIR}/lib64`);
+	}
+	fs.rmSync(expected, { recursive: true, force: true });
+	fs.symlinkSync("lib64", expected, "dir");
+	log("libsrt lib64 -> lib for node-gyp");
+}
 
 async function main() {
 	if (process.argv.includes("--check")) {
@@ -271,6 +285,7 @@ async function main() {
 			cwd: DEP,
 			env: { ...process.env, NODE_SRT_CHECKOUT: SRT_TAG }
 		});
+		normalizePosixLibDir();
 		log("compiling N-API addon...");
 		run("npm", ["--prefix", DEP, "run", "rebuild"], { shell: false });
 		log(`done: libsrt ${SRT_TAG} + addon ready`);
