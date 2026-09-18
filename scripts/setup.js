@@ -285,9 +285,11 @@ async function main() {
 			cwd: DEP,
 			env: { ...process.env, NODE_SRT_CHECKOUT: SRT_TAG }
 		});
-		normalizePosixLibDir();
-		log("compiling N-API addon...");
-		run("npm", ["--prefix", DEP, "run", "rebuild"], { shell: false });
+		const rebuildArgs = ["--prefix", DEP, "run", "rebuild"];
+		if (process.env.PREBUILD_ARCH) {
+			rebuildArgs.push("--", `--arch=${process.env.PREBUILD_ARCH}`);
+		}
+		run("npm", rebuildArgs, { shell: false });
 		log(`done: libsrt ${SRT_TAG} + addon ready`);
 		return;
 	}

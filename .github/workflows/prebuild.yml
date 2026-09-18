@@ -51,6 +51,7 @@ jobs:
         run: |
           microdnf install -y tcl openssl-devel cmake pkgconf-pkg-config
           microdnf clean all
+          echo "PREBUILD_ARCH=x64" >> "$GITHUB_ENV"
       - name: Install Debian ARM64 build prerequisites
         if: matrix.artifact == 'linux-arm64'
         run: |
@@ -60,6 +61,7 @@ jobs:
           echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
           echo "CFLAGS=-I/usr/include/aarch64-linux-gnu -idirafter /usr/include" >> "$GITHUB_ENV"
           echo "CXXFLAGS=-I/usr/include/aarch64-linux-gnu -idirafter /usr/include" >> "$GITHUB_ENV"
+          echo "PREBUILD_ARCH=arm64" >> "$GITHUB_ENV"
       - name: Check Linux container runtime
         if: runner.os == 'Linux'
         run: |
