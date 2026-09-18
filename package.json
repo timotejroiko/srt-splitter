@@ -7,14 +7,22 @@
 		"srt-splitter": "index.js"
 	},
 	"type": "commonjs",
+	"files": [
+		"config.js",
+		"index.js",
+		"prebuilds",
+		"scripts",
+		"src"
+	],
 	"engines": {
 		"node": ">=18"
 	},
 	"scripts": {
 		"start": "node index.js",
+		"prebuild": "node scripts/prebuild.js",
 		"setup": "node scripts/setup.js"
 	},
-	"dependencies": {
-		"@eyevinn/srt": "github:Eyevinn/node-srt#0dfdb40dde2a2d81b1fc79e5d3cb3cf1076db465"
+	"devDependencies": {
+		"@eyevinn/srt": "git+https://github.com/Eyevinn/node-srt.git#0dfdb40dde2a2d81b1fc79e5d3cb3cf1076db465"
 	}
 }

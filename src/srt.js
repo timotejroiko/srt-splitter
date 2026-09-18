@@ -1,5 +1,8 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
+
 /**
  * Lazy native binding + numeric constants.
  * Required lazily so --help and config errors work without the addon
@@ -9,16 +12,36 @@
  * LIVE_MAX_PAYLOAD is the live-mode message ceiling under the default
  * IPv4 MSS (1500 - 28 IP/UDP - 16 SRT). RCVBUF_CELL_SIZE is separate:
  * libsrt converts SRTO_RCVBUF bytes into cells of MSS - IP/UDP headers.
- * Receive buffers use the cell size; reads and PAYLOADSIZE use the payload
- * ceiling.
+ * Receive buffers use the cell size; reads and PAYLOADSIZE use the
+ * payload ceiling.
  */
 const DEFAULT_MSS = 1500;
 const IPV4_UDP_HEADER = 28;
 const SRT_DATA_HEADER = 16;
 const RCVBUF_CELL_SIZE = DEFAULT_MSS - IPV4_UDP_HEADER;
 const LIVE_MAX_PAYLOAD = RCVBUF_CELL_SIZE - SRT_DATA_HEADER;
+const PREBUILD = path.join(__dirname, "..", "prebuilds", `${process.platform}-${process.arch}`, "srt.node");
+
+function loadBinding() {
+	if (fs.existsSync(PREBUILD)) {
+		try {
+			return require(PREBUILD);
+		} catch (err) {
+			throw new Error(`failed to load prebuilt SRT addon at ${PREBUILD}: ${err.message}`, { cause: err });
+		}
+	}
+	try {
+		return require("@eyevinn/srt");
+	} catch (err) {
+		throw new Error(`no prebuilt SRT addon for ${process.platform}/${process.arch}, and source loading failed: ${err.message}`, { cause: err });
+	}
+}
+
 function createSrt() {
-	const { SRT } = require("@eyevinn/srt");
+	const { SRT } = loadBinding();
+	if (typeof SRT !== "function") {
+		throw new Error("SRT native addon does not export an SRT constructor");
+	}
 	const srt = new SRT();
 	const so = (name, fb) => (SRT[name] !== undefined ? SRT[name] : fb);
 	const c = {
