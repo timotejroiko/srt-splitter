@@ -58,8 +58,8 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y tcl libssl-dev:arm64 cmake pkg-config
           echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
-          echo "CFLAGS=-I/usr/include" >> "$GITHUB_ENV"
-          echo "CXXFLAGS=-I/usr/include" >> "$GITHUB_ENV"
+          echo "CFLAGS=-I/usr/include/aarch64-linux-gnu -idirafter /usr/include" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-I/usr/include/aarch64-linux-gnu -idirafter /usr/include" >> "$GITHUB_ENV"
       - name: Check Linux container runtime
         if: runner.os == 'Linux'
         run: |
