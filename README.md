@@ -8,7 +8,7 @@ It uses a single upstream connection and accepts downstream client connections o
 
 - Node.js 18 or newer
 - An SRT-compatible source
-- Network access between the source, splitter, and downstream clients
+- Network access between the source, splitter and downstream clients
 
 Prebuilt native addons are included for:
 
