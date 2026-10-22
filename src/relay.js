@@ -443,8 +443,8 @@ class Relay {
 					} else {
 						this.bytesOut += chunk.length;
 					}
-				} catch {
-					this.dropEgress(fd, "send error");
+				} catch (err) {
+					this.dropEgress(fd, "send error: " + err.message);
 				}
 			}
 		}
